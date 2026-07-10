@@ -67,18 +67,7 @@ The system utilizes a dual-controller, **Master-Slave architecture** to split hi
 
 ---
 
-## 📸 Visuals
-
-| System Overview | Circuit & Wiring | IoT Dashboard |
-|---|---|---|
-| *[img/Schematic Flow Chart.jpg]* | *[Insert a photo of your PCB or breadboard wiring]* | *[Insert a screenshot of your phone/web dashboard]* |
-
-*(Note: To display your actual photos here on GitHub, upload the images to your repository folder and replace the text inside the brackets with your image paths, e.g., `img/greenhouse.jpg`)*
-
----
-
 ## 👤 Author
 
 * **Engr. L A Jhon A. Tilla-in, ECT**
 * Email: l.tillain.ece@gmail.com
-* LinkedIn: [Your LinkedIn Link]
