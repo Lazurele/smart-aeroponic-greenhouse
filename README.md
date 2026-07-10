@@ -9,7 +9,7 @@ An automated, IoT-based environmental control and remote monitoring system desig
 ## 🚀 Features
 
 * **Dual-Controller Automation:** Efficient workload separation using a Master-Slave system configuration.
-* **Vertical Aeroponics:** Space-saving agricultural design utilizing suspended root systems for faster growth and 90%+ less water usage than traditional soil farming.
+* **Vertical Aeroponics:** Space-saving agricultural design utilizing suspended root systems for faster growth and less water usage than traditional soil farming.
 * **IoT Remote Monitoring:** A dedicated cloud-connected dashboard to monitor system health and sensor telemetry from anywhere.
 * **Real-Time Responsiveness:** Dedicated hardware handling ensures instant actuation based on changing environmental parameters.
 
