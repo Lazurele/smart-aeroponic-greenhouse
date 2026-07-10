@@ -1,0 +1,345 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
+#include <Adafruit_NeoPixel.h>
+
+// Sensor Pin Definitions
+#define TDS_SENSOR_PIN A0
+#define PH_SENSOR_PIN A1
+#define CURRENT_SENSOR_PIN A2
+#define VOLTAGE_SENSOR_PIN A3
+#define ONE_WIRE_BUS_1 10
+#define DHT1_PIN 45
+#define DHT2_PIN 46
+#define DHT3_PIN 47
+#define DHT4_PIN 48
+#define DHT5_PIN 49
+#define ECHO_PIN 50
+#define TRIG_PIN 51
+#define DHT_TYPE DHT11
+
+// Relay Pin Definitions
+#define LED_TOWER1_RELAY_PIN 22
+#define LED_TOWER2_RELAY_PIN 23
+#define INTAKE_FANS_PIN 27
+#define EXHAUST_FANS_PIN 26
+#define TOWER1_MOTOR_PIN 29
+#define TOWER2_MOTOR_PIN 28
+#define NUTRIENT_PUMP1_PIN 31
+#define NUTRIENT_PUMP2_PIN 30
+#define MIXING_PUMP_PIN 33
+#define TANK_REFILL_PIN 32
+#define MISTING_PUMP_PIN 35
+#define SSR_PIN 37
+
+//------------------------------------------------------------------------------
+// LED Strip Pin Definitions
+//------------------------------------------------------------------------------
+#define LED_STRIP_PIN_1 36
+#define LED_STRIP_PIN_2 38
+#define LED_STRIP_PIN_3 39
+#define LED_STRIP_PIN_4 40
+#define LED_STRIP_PIN_5 41
+#define LED_STRIP_PIN_6 42
+#define LED_STRIP_PIN_7 43
+#define LED_STRIP_PIN_8 44
+#define NUM_LEDS 108
+
+//-----------------------------------------------------------------------------
+// LED Strip Instance Array
+//------------------------------------------------------------------------------
+#define LED_STRIP_COUNT 8
+Adafruit_NeoPixel ledStrips[LED_STRIP_COUNT] = {
+    Adafruit_NeoPixel(NUM_LEDS, LED_STRIP_PIN_1, NEO_GRB + NEO_KHZ800),
+    Adafruit_NeoPixel(NUM_LEDS, LED_STRIP_PIN_2, NEO_GRB + NEO_KHZ800),
+    Adafruit_NeoPixel(NUM_LEDS, LED_STRIP_PIN_3, NEO_GRB + NEO_KHZ800),
+    Adafruit_NeoPixel(NUM_LEDS, LED_STRIP_PIN_4, NEO_GRB + NEO_KHZ800),
+    Adafruit_NeoPixel(NUM_LEDS, LED_STRIP_PIN_5, NEO_GRB + NEO_KHZ800),
+    Adafruit_NeoPixel(NUM_LEDS, LED_STRIP_PIN_6, NEO_GRB + NEO_KHZ800),
+    Adafruit_NeoPixel(NUM_LEDS, LED_STRIP_PIN_7, NEO_GRB + NEO_KHZ800),
+    Adafruit_NeoPixel(NUM_LEDS, LED_STRIP_PIN_8, NEO_GRB + NEO_KHZ800)
+};
+
+// Constants
+#define SCOUNT 15
+#define SERIAL_BAUD_RATE 115200
+#define RELAY_ACTIVE_LOW true
+#define SSR_ACTIVE_HIGH true
+
+// Task Scheduler Variables
+unsigned long lastTDSReadTime = 0;
+unsigned long lastUltrasonicReadTime = 0;
+unsigned long lastPHReadTime = 0;
+unsigned long lastEnvSensorReadTime = 0;
+unsigned long lastSensorSendTime = 0;
+const unsigned long TDS_INTERVAL = 40;
+const unsigned long PH_INTERVAL = 800;
+const unsigned long ENV_SENSOR_INTERVAL = 5000;
+const unsigned long SENSOR_SEND_INTERVAL = 1000;
+const unsigned long ULTRASONIC_INTERVAL = 200;
+
+// Sensor Instances
+OneWire oneWireBus1(ONE_WIRE_BUS_1);
+DallasTemperature ds18b20Water(&oneWireBus1);
+DHT dht1(DHT1_PIN, DHT_TYPE);
+DHT dht2(DHT2_PIN, DHT_TYPE);
+DHT dht3(DHT3_PIN, DHT_TYPE);
+DHT dht4(DHT4_PIN, DHT_TYPE);
+DHT dht5(DHT5_PIN, DHT_TYPE);
+
+// Global Variables
+int analogBuffer[SCOUNT];
+int analogBufferIndex = 0;
+float waterTemperature = 25.0;
+int tdsRaw = 0;
+int phRaw = 0;
+float envTempC1 = 0.0, envHumidity1 = 0.0;
+float envTempC2 = 0.0, envHumidity2 = 0.0;
+float envTempC3 = 0.0, envHumidity3 = 0.0;
+float envTempC4 = 0.0, envHumidity4 = 0.0;
+float envTempC5 = 0.0, envHumidity5 = 0.0;
+float distanceCM = 0.0;
+float currentReading = 0.0;
+float voltageReading = 0.0;
+
+// Calibration Constants
+const float CURRENT_SENSOR_SLOPE = 0.0645;
+const float CURRENT_SENSOR_INTERCEPT = -32.9225;
+const float VOLTAGE_SENSOR_SLOPE = 0.15;
+const float VOLTAGE_SENSOR_INTERCEPT = 13.1;
+
+// Function Prototypes
+void initializeSensors();
+void initializeActuators();
+void readDHTData();
+float readDS18B20WaterTemperature();
+void sendSensorData();
+int getMedianNum(int bArray[], int iFilterLen);
+void executeCommand(String command);
+void controlRelay(int pin, bool state);
+void controlLEDStrip(uint32_t color);
+float readUltrasonicDistance();
+
+void setup() {
+    Serial.begin(SERIAL_BAUD_RATE);
+    initializeSensors();
+    initializeActuators();
+
+// Initialize all LED strips
+    for (int i = 0; i < LED_STRIP_COUNT; i++) {
+        ledStrips[i].begin();
+        ledStrips[i].show(); // Turn off initially
+    }
+}
+
+void loop() {
+    unsigned long currentTime = millis();
+
+    if (Serial.available()) {
+        String command = Serial.readStringUntil('\n');
+        executeCommand(command);
+    }
+
+    if (currentTime - lastTDSReadTime >= TDS_INTERVAL) {
+        lastTDSReadTime = currentTime;
+        analogBuffer[analogBufferIndex] = analogRead(TDS_SENSOR_PIN);
+        analogBufferIndex = (analogBufferIndex + 1) % SCOUNT;
+        tdsRaw = getMedianNum(analogBuffer, SCOUNT);
+    }
+
+    if (currentTime - lastPHReadTime >= PH_INTERVAL) {
+        lastPHReadTime = currentTime;
+        phRaw = analogRead(PH_SENSOR_PIN);
+    }
+
+    if (currentTime - lastEnvSensorReadTime >= ENV_SENSOR_INTERVAL) {
+        lastEnvSensorReadTime = currentTime;
+        readDHTData();
+    }
+
+    if (currentTime - lastUltrasonicReadTime >= ULTRASONIC_INTERVAL) {
+        lastUltrasonicReadTime = currentTime;
+        distanceCM = readUltrasonicDistance();
+    }
+
+    currentReading = CURRENT_SENSOR_SLOPE * analogRead(CURRENT_SENSOR_PIN) + CURRENT_SENSOR_INTERCEPT;
+    voltageReading = VOLTAGE_SENSOR_SLOPE * analogRead(VOLTAGE_SENSOR_PIN) + VOLTAGE_SENSOR_INTERCEPT;
+
+    if (currentTime - lastSensorSendTime >= SENSOR_SEND_INTERVAL) {
+        lastSensorSendTime = currentTime;
+        sendSensorData();
+    }
+}
+
+void readDHTData() {
+    envTempC1 = dht1.readTemperature();
+    envHumidity1 = dht1.readHumidity();
+    envTempC2 = dht2.readTemperature();
+    envHumidity2 = dht2.readHumidity();
+    envTempC3 = dht3.readTemperature();
+    envHumidity3 = dht3.readHumidity();
+    envTempC4 = dht4.readTemperature();
+    envHumidity4 = dht4.readHumidity();
+    envTempC5 = dht5.readTemperature();
+    envHumidity5 = dht5.readHumidity();
+}
+
+void initializeSensors() {
+    pinMode(TDS_SENSOR_PIN, INPUT);
+    pinMode(PH_SENSOR_PIN, INPUT);
+    pinMode(CURRENT_SENSOR_PIN, INPUT);
+    pinMode(VOLTAGE_SENSOR_PIN, INPUT);
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+
+    ds18b20Water.begin();
+    dht1.begin();
+    dht2.begin();
+    dht3.begin();
+    dht4.begin();
+    dht5.begin();
+}
+
+void initializeActuators() {
+    pinMode(LED_TOWER1_RELAY_PIN, OUTPUT);
+    pinMode(LED_TOWER2_RELAY_PIN, OUTPUT);
+    pinMode(INTAKE_FANS_PIN, OUTPUT);
+    pinMode(EXHAUST_FANS_PIN, OUTPUT);
+    pinMode(TOWER1_MOTOR_PIN, OUTPUT);
+    pinMode(TOWER2_MOTOR_PIN, OUTPUT);
+    pinMode(NUTRIENT_PUMP1_PIN, OUTPUT);
+    pinMode(NUTRIENT_PUMP2_PIN, OUTPUT);
+    pinMode(MIXING_PUMP_PIN, OUTPUT);
+    pinMode(TANK_REFILL_PIN, OUTPUT);
+    pinMode(MISTING_PUMP_PIN, OUTPUT);
+    pinMode(SSR_PIN, OUTPUT);
+
+    // Initialize all relays to OFF state
+    digitalWrite(LED_TOWER1_RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(LED_TOWER2_RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(INTAKE_FANS_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(EXHAUST_FANS_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(TOWER1_MOTOR_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(TOWER2_MOTOR_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(NUTRIENT_PUMP1_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(NUTRIENT_PUMP2_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(MIXING_PUMP_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(TANK_REFILL_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(MISTING_PUMP_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    digitalWrite(SSR_PIN, SSR_ACTIVE_HIGH ? LOW : HIGH);
+}
+
+float readDS18B20WaterTemperature() {
+    ds18b20Water.requestTemperatures();
+    float temp = ds18b20Water.getTempCByIndex(0);
+    #ifdef DEVICE_DISCONNECTED_C
+    return temp != DEVICE_DISCONNECTED_C ? temp : 25.0;
+    #else
+    return temp;
+    #endif
+}
+
+void sendSensorData() {
+    waterTemperature = readDS18B20WaterTemperature();
+
+    Serial.print("SENSOR_DATA:");
+    Serial.print(waterTemperature, 1); Serial.print(",");
+    Serial.print(tdsRaw); Serial.print(",");
+    Serial.print(phRaw); Serial.print(",");
+    Serial.print(envTempC1, 1); Serial.print(",");
+    Serial.print(envHumidity1, 1); Serial.print(",");
+    Serial.print(envTempC2, 1); Serial.print(",");
+    Serial.print(envHumidity2, 1); Serial.print(",");
+    Serial.print(envTempC3, 1); Serial.print(",");
+    Serial.print(envHumidity3, 1); Serial.print(",");
+    Serial.print(envTempC4, 1); Serial.print(",");
+    Serial.print(envHumidity4, 1); Serial.print(",");
+    Serial.print(envTempC5, 1); Serial.print(",");
+    Serial.print(envHumidity5, 1); Serial.print(",");
+    Serial.print(distanceCM, 2); Serial.print(",");
+    Serial.print(currentReading, 2); Serial.print(",");
+    Serial.println(voltageReading, 2);
+    delay(10);
+}
+
+int getMedianNum(int bArray[], int iFilterLen) {
+    int bTab[SCOUNT];
+    memcpy(bTab, bArray, iFilterLen * sizeof(int));
+    for (int i = 1; i < iFilterLen; i++) {
+        int key = bTab[i];
+        int j = i - 1;
+        while (j >= 0 && bTab[j] > key) {
+            bTab[j + 1] = bTab[j];
+            j--;
+        }
+        bTab[j + 1] = key;
+    }
+    return (iFilterLen % 2 == 0) ? (bTab[iFilterLen/2] + bTab[iFilterLen/2-1])/2 : bTab[iFilterLen/2];
+}
+
+void executeCommand(String command) {
+    if (command.startsWith("MISTING_PUMP:")) {
+        controlRelay(MISTING_PUMP_PIN, command.substring(13).toInt());
+    } else if (command.startsWith("NUTRIENT_PUMP:")) {
+        bool state = command.substring(14).toInt();
+        controlRelay(NUTRIENT_PUMP1_PIN, state);
+        controlRelay(NUTRIENT_PUMP2_PIN, state);
+    } else if (command.startsWith("INTAKE_FANS:")) {
+        controlRelay(INTAKE_FANS_PIN, command.substring(12).toInt());
+    } else if (command.startsWith("EXHAUST_FANS:")) {
+        controlRelay(EXHAUST_FANS_PIN, command.substring(13).toInt());
+    } else if (command.startsWith("MIXING_PUMP:")) {
+        controlRelay(MIXING_PUMP_PIN, command.substring(12).toInt());
+    } else if (command.startsWith("TANK_REFILL:")) {
+        controlRelay(TANK_REFILL_PIN, command.substring(12).toInt());
+    } else if (command.startsWith("TOWER1_MOTOR:")) {
+        controlRelay(TOWER1_MOTOR_PIN, command.substring(14).toInt());
+    } else if (command.startsWith("TOWER2_MOTOR:")) {
+        controlRelay(TOWER2_MOTOR_PIN, command.substring(14).toInt());
+    } else if (command.startsWith("LED_TOWER1:")) {
+        controlRelay(LED_TOWER1_RELAY_PIN, command.substring(11).toInt());
+    } else if (command.startsWith("LED_TOWER2:")) {
+        controlRelay(LED_TOWER2_RELAY_PIN, command.substring(11).toInt());
+    } else if (command.startsWith("LED_STRIP:")) {
+        uint32_t color = command.substring(10).toInt();
+        controlLEDStrip(color);
+    } else if(command.startsWith("RELAY:")) {
+        int pin = command.substring(6, 8).toInt();
+        bool state = command.substring(9).toInt();
+         controlRelay(pin, state);
+}
+}
+
+//------------------------------------------------------------------------------
+// LED Strip Control
+//------------------------------------------------------------------------------
+void controlLEDStrip(uint32_t color) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+        for (int s = 0; s < LED_STRIP_COUNT; s++) {
+            ledStrips[s].setPixelColor(i, color);
+        }
+    }
+    for (int s = 0; s < LED_STRIP_COUNT; s++) {
+        ledStrips[s].show();
+    }
+    Serial.print("LED_STRIP_SET:");
+    Serial.println(color);
+}
+
+void controlRelay(int pin, bool state) {
+    if (pin == SSR_PIN) {
+        digitalWrite(pin, SSR_ACTIVE_HIGH ? state : !state);
+    } else {
+        digitalWrite(pin, RELAY_ACTIVE_LOW ? !state : state);
+    }
+}
+
+float readUltrasonicDistance() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    long duration = pulseIn(ECHO_PIN, HIGH, 20000);
+    return duration > 0 ? duration * 0.034 / 2 : -1;
+}
