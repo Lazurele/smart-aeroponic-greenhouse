@@ -1,0 +1,799 @@
+import cv2
+from flask import Flask, Response, render_template_string
+import serial
+import time
+import logging
+import requests
+import statistics
+import threading
+import json
+import paho.mqtt.client as mqtt
+import datetime
+
+#------------------------------------------------------------------------------
+# Constants
+#------------------------------------------------------------------------------
+VREF = 5                  # Analog reference voltage (Volt)
+ADC_RESOLUTION = 1023       # Arduino Mega ADC resolution (10-bit)
+MIN_VOLTAGE_THRESHOLD = 0.02 # Minimum valid voltage
+RETRY_INTERVAL = 1          # Retry interval in seconds
+MAX_RETRIES = 5             # Maximum number of retries
+DEFAULT_TEMPERATURE = 25.0  # Default temperature in case of failure
+
+#------------------------------------------------------------------------------
+# Calibration Constants
+#------------------------------------------------------------------------------
+TDS_A = 133.42 * 1.0        # Cubic term coefficient
+TDS_B = 255.86 * 1.0        # Quadratic term coefficient
+TDS_C = 857.39 * 1.0        # Linear term coefficient
+TDS_D = 0.8                # Scaling factor
+PH_VOLTAGE_AT_PH_4 = 2.100  # Voltage at pH 4
+PH_VOLTAGE_AT_PH_7 = 1.550  # Voltage at pH 7
+PH_VOLTAGE_AT_PH_10 = 1.000 # Voltage at pH 10
+
+#------------------------------------------------------------------------------
+# Target Ranges
+#------------------------------------------------------------------------------
+TDS_MIN = 800               # Minimum acceptable TDS (ppm)
+TDS_MAX = 1200              # Maximum acceptable TDS (ppm)
+PH_MIN = 5.5                # Minimum acceptable pH
+PH_MAX = 6.5                # Maximum acceptable pH
+TEMP_MIN = 18.0             # Minimum acceptable Greenhouse temperature (Celsius)
+TEMP_MAX = 20.0             # Maximum acceptable Greenhouse temperature (Celsius)
+HUMIDITY_MIN = 50.0        # Minimum acceptable humidity (%)
+HUMIDITY_MAX = 70.0        # Maximum acceptable humidity (%)
+
+#------------------------------------------------------------------------------
+# Target Averages
+#------------------------------------------------------------------------------
+TARGET_TDS = (TDS_MIN + TDS_MAX) / 2  # Average of TDS range
+TARGET_PH = (PH_MIN + PH_MAX) / 2     # Average of pH range
+TARGET_TEMP = (TEMP_MIN + TEMP_MAX) / 2  # Average of temperature range
+
+#------------------------------------------------------------------------------
+# Pump Control Constants
+#------------------------------------------------------------------------------
+# Misting Pump Constants
+MISTING_INTERVAL = 1800     # 30 minutes between misting cycles (seconds)
+MISTING_DURATION = 900      # 15 minutes misting duration (seconds)
+MIN_MISTING_CYCLE_GAP = 900 # 15 minutes minimum between cycles (seconds)
+
+# Tank Reservoir Constants
+TANK_EMPTY_LEVEL = 26       # Distance in cm when the tank is empty
+TANK_LOW_LEVEL = 20         # Distance in cm when the tank is low
+TANK_HALF_LEVEL = 16        # Distance in cm when the tank is half full
+TANK_FULL_LEVEL = 8         # Distance in cm when the tank is full
+TANK_OVERLOW_LEVEL = 2      # Distance in cm when the tank is overflowing
+REFILL_SETTLING_TIME = 60   # 1 minute settling after refill (seconds)
+
+# Nutrient Pump Constants
+NUTRIENT_PUMP_DURATION = 75 # Duration to run nutrient pumps (seconds)
+
+#------------------------------------------------------------------------------
+# Global Variables
+#------------------------------------------------------------------------------
+# TDS and pH Baseline
+tds_baseline = None
+ph_baseline = None
+
+# Misting Pump Control
+last_misting_time = 0
+misting_pump_active = False
+last_misting_end_time = 0
+
+# Tank Reservoir Control
+tank_refill_active = False
+previous_tank_level = None
+refill_complete_time = 0
+tank_was_low_or_empty = False
+
+# Nutrient Pump Control
+nutrients_added_this_cycle = False  # Track if nutrients were added this fill cycle
+nutrient_pump_active = False
+nutrient_pump_start_time = 0
+mixing_pump_active = False
+mixing_pump_start_time = 0
+
+# System State
+manual_override = False
+emergency_stop = False
+distance_sensor_fail_time = None
+MAX_DISTANCE_SENSOR_FAIL_TIME = 300  # 5 minutes
+
+# Relay states for LED Tower 1 and 2
+relay22_state = False
+relay23_state = False
+relay28_state = False
+relay29_state = False
+
+#------------------------------------------------------------------------------
+# Serial Communication and ThingsBoard Configuration
+#------------------------------------------------------------------------------
+SERIAL_PORT = "/dev/ttyACM0"  # Adjust based on your setup
+BAUD_RATE = 115200
+
+# ThingsBoard Configuration
+THINGSBOARD_URL = "https://thingsboard.cloud/api/v1/{ACCESS_TOKEN}/telemetry"  
+ACCESS_TOKEN = "bebears26"  # Replace with your actual access token
+
+# MQTT Setup for ThingsBoard RPC
+THINGSBOARD_HOST = "thingsboard.cloud"
+
+# Logging Configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("hydroponic_system.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# Serial Connection Setup
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2)
+    logging.info(f"Serial connection established on {SERIAL_PORT} at {BAUD_RATE} baud.")
+except serial.SerialException as e:
+    logging.error(f"Failed to open serial port {SERIAL_PORT}: {e}")
+    ser = None
+
+#------------------------------------------------------------------------------
+# Flask Web Server and Camera Setup
+#------------------------------------------------------------------------------
+app = Flask(__name__)
+
+# Initialize the camera
+try:
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logging.error("Could not open camera - camera functionality disabled")
+        CAMERA_ENABLED = False
+    else:
+        logging.info("Camera initialized successfully")
+        CAMERA_ENABLED = True
+except Exception as e:
+    logging.error(f"Camera initialization failed: {e}")
+    CAMERA_ENABLED = False
+
+def gen_frames():
+    """Video streaming generator function."""
+    while True:
+        if not CAMERA_ENABLED:
+            time.sleep(1)
+            continue
+            
+        try:
+            success, frame = cap.read()
+            if not success:
+                logging.warning("Failed to read camera frame")
+                time.sleep(1)
+                continue
+                
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret:
+                logging.warning("Failed to encode frame")
+                time.sleep(1)
+                continue
+                
+            frame = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        except Exception as e:
+            logging.error(f"Error in frame generation: {e}")
+            time.sleep(1)
+
+@app.route('/')
+def index():
+    """Video streaming home page."""
+    return render_template_string('''
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <title>Hydroponic System Monitoring</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        .container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+        .video-panel {
+            flex: 1;
+            min-width: 500px;
+            border: 1px solid #ddd;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .status-panel {
+            flex: 1;
+            min-width: 300px;
+            border: 1px solid #ddd;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        h1 {
+            color: #2c3e50;
+        }
+        h2 {
+            color: #3498db;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 5px;
+        }
+        .status-item {
+            margin-bottom: 10px;
+        }
+        .status-label {
+            font-weight: bold;
+        }
+    </style>
+    </head>
+    <body>
+    <h1>Hydroponic System Monitoring</h1>
+    <div class="container">
+        <div class="video-panel">
+            <h2>Live Camera Feed</h2>
+            <img src="/video_feed" width="100%">
+        </div>
+        <div class="status-panel">
+            <h2>System Status</h2>
+            <div class="status-item">
+                <span class="status-label">Camera Status:</span>
+                <span id="camera-status">{% if camera_enabled %}Active{% else %}Disabled{% endif %}</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Serial Connection:</span>
+                <span id="serial-status">{% if serial_connected %}Active{% else %}Disconnected{% endif %}</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">System Mode:</span>
+                <span id="system-mode">{% if emergency_stop %}EMERGENCY STOP{% elif manual_override %}Manual Override{% else %}Auto{% endif %}</span>
+            </div>
+            <!-- More status items can be added here -->
+        </div>
+    </div>
+    </body>
+    </html>
+    ''', camera_enabled=CAMERA_ENABLED, 
+        serial_connected=ser is not None and ser.is_open,
+        emergency_stop=emergency_stop,
+        manual_override=manual_override)
+
+@app.route('/video_feed')
+def video_feed():
+    """Video streaming route."""
+    return Response(gen_frames(),
+                   mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def run_flask_app():
+    """Run the Flask web server."""
+    app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
+
+#------------------------------------------------------------------------------
+# MQTT RPC Handler for LED Tower Control
+#------------------------------------------------------------------------------
+def on_connect(client, userdata, flags, rc):
+    client.subscribe('v1/devices/me/rpc/request/+')
+
+def on_message(client, userdata, msg):
+    global relay22_state, relay23_state, relay28_state, relay29_state
+
+    try:
+        data = json.loads(msg.payload.decode())
+        method = data.get('method')
+        params = data.get('params')
+        request_id = msg.topic.split('/')[-1]
+
+        # LED Tower 1 (Relay 22)
+        if method == "setRelay22" or method == "setValue22":
+            relay22_state = bool(params)
+            color = 65535 if relay22_state else 0
+            control_led_strip_with_timer(relay22_state, 22, color)
+            client.publish(f'v1/devices/me/rpc/response/{request_id}', json.dumps(relay22_state))
+        elif method == "getRelay22" or method == "getvalue22":
+            client.publish(f'v1/devices/me/rpc/response/{request_id}', json.dumps(relay22_state))
+
+        # LED Tower 2 (Relay 23)
+        elif method == "setRelay23" or method == "setValue23":
+            relay23_state = bool(params)
+            color = 65535 if relay23_state else 0
+            control_led_strip_with_timer(relay23_state, 23, color)
+            client.publish(f'v1/devices/me/rpc/response/{request_id}', json.dumps(relay23_state))
+        elif method == "getRelay23" or method == "getvalue23":
+            client.publish(f'v1/devices/me/rpc/response/{request_id}', json.dumps(relay23_state))
+        
+        #Motor Tower 1 (Relay 28)
+        elif method == "setRelay28" or method == "setValue28":
+            relay28_state = bool(params)
+            send_command(f"RELAY:28,{1 if relay28_state else 0}")
+            client.publish(f'v1/devices/me/rpc/response/{request_id}', json.dumps(relay28_state))
+        elif method == "getRelay28" or method == "getvalue28":
+            relay28_state = ser.readline().decode().strip()
+            client.publish(f'v1/devices/me/rpc/response/{request_id}', json.dumps(relay28_state))
+
+        #Motor Tower 2 (Relay 29)
+        elif method == "setRelay29" or method == "setValue29":
+            relay29_state = bool(params)
+            send_command(f"RELAY:29,{1 if relay29_state else 0}")  # <-- Add colon here
+            client.publish(f'v1/devices/me/rpc/response/{request_id}', json.dumps(relay29_state))
+        elif method == "getRelay29" or method == "getvalue29":
+            relay29_state = ser.readline().decode().strip()
+            client.publish(f'v1/devices/me/rpc/response/{request_id}', json.dumps(relay29_state))
+
+    except Exception as e:
+        logging.error(f"Error handling RPC: {e}")
+
+def start_mqtt_listener():
+    client = mqtt.Client()
+    client.username_pw_set(ACCESS_TOKEN)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(THINGSBOARD_HOST, 1883, 60)
+    client.loop_forever()
+
+#------------------------------------------------------------------------------
+# Sensor Data Functions
+#------------------------------------------------------------------------------
+def read_sensor_data():
+    """Read sensor data from the Arduino Mega."""
+    try:
+        raw_line = ser.readline().decode().strip()
+        logging.debug(f"Raw data received from Arduino Mega: {raw_line}")
+        
+        if raw_line.startswith("SENSOR_DATA:"):
+            parts = raw_line.split(":")[1].split(",")
+            logging.debug(f"Parsed parts: {parts}")
+            
+            if len(parts) == 16:
+                try:
+                    return {
+                        "water_temperature": float(parts[0]) if parts[0] != 'nan' else None,
+                        "tds_raw_adc": int(parts[1]) if parts[1] != 'nan' else None,
+                        "ph_raw_adc": int(parts[2]) if parts[2] != 'nan' else None,
+                        "dht1_temp_c": float(parts[3]) if parts[3] != 'nan' else None,
+                        "dht1_humidity": float(parts[4]) if parts[4] != 'nan' else None,
+                        "dht2_temp_c": float(parts[5]) if parts[5] != 'nan' else None,
+                        "dht2_humidity": float(parts[6]) if parts[6] != 'nan' else None,
+                        "dht3_temp_c": float(parts[7]) if parts[7] != 'nan' else None,
+                        "dht3_humidity": float(parts[8]) if parts[8] != 'nan' else None,
+                        "dht4_temp_c": float(parts[9]) if parts[9] != 'nan' else None,
+                        "dht4_humidity": float(parts[10]) if parts[10] != 'nan' else None,
+                        "dht5_temp_c": float(parts[11]) if parts[11] != 'nan' else None,
+                        "dht5_humidity": float(parts[12]) if parts[12] != 'nan' else None,
+                        "distance_cm": float(parts[13]) if parts[13] != 'nan' else None,
+                        "current_reading": float(parts[14]) if parts[14] != 'nan' else None,
+                        "voltage_reading": float(parts[15]) if parts[15] != 'nan' else None
+                    }
+                except ValueError as e:
+                    logging.error(f"Error parsing sensor data: {e}")
+            else:
+                logging.warning(f"Incomplete data received. Expected 16 values, got {len(parts)}.")
+        else:
+            logging.warning(f"Unexpected data format: {raw_line}")
+    except Exception as e:
+        logging.error(f"Error reading sensor data: {e}")
+    return None
+
+def calculate_tds(tds_raw_adc, water_temp):
+    """Calculate TDS value from raw ADC reading and water temperature."""
+    if tds_raw_adc is None or water_temp is None:
+        return None
+        
+    average_voltage = tds_raw_adc * VREF / ADC_RESOLUTION
+    if average_voltage < MIN_VOLTAGE_THRESHOLD:
+        logging.warning("Probes not submerged! Invalid TDS readings.")
+        return None
+        
+    compensation_coefficient = 1.0 + 0.018 * (water_temp - 25.0)
+    compensation_voltage = average_voltage / compensation_coefficient
+    tds = (TDS_A * compensation_voltage**3 -
+           TDS_B * compensation_voltage**2 +
+           TDS_C * compensation_voltage) * TDS_D
+    return tds
+
+def calculate_ph(ph_raw_adc):
+    """Calculate pH value from raw ADC reading."""
+    if ph_raw_adc is None:
+        return None
+        
+    voltage = ph_raw_adc * VREF / ADC_RESOLUTION
+    if voltage < 0.03 or voltage > 3.2:
+        logging.warning("Invalid voltage reading from pH sensor!")
+        return None
+        
+    TOLERANCE = 1e-6
+    if PH_VOLTAGE_AT_PH_7 - TOLERANCE <= voltage <= PH_VOLTAGE_AT_PH_4 + TOLERANCE:
+        ph = 4.0 + (7.0 - 4.0) * (voltage - PH_VOLTAGE_AT_PH_4) / (PH_VOLTAGE_AT_PH_7 - PH_VOLTAGE_AT_PH_4)
+    elif PH_VOLTAGE_AT_PH_10 - TOLERANCE <= voltage < PH_VOLTAGE_AT_PH_7 + TOLERANCE:
+        ph = 7.0 + (10.0 - 7.0) * (voltage - PH_VOLTAGE_AT_PH_7) / (PH_VOLTAGE_AT_PH_10 - PH_VOLTAGE_AT_PH_7)
+    else:
+        return None
+        
+    return max(0.0, min(ph, 14.0))
+
+def average_dht_readings(sensor_data):
+    """Average the temperature and humidity readings from the five DHT11 sensors."""
+    temps = [
+        sensor_data["dht1_temp_c"],
+        sensor_data["dht2_temp_c"],
+        sensor_data["dht3_temp_c"],
+        sensor_data["dht4_temp_c"],
+        sensor_data["dht5_temp_c"]
+    ]
+    humidities = [
+        sensor_data["dht1_humidity"],
+        sensor_data["dht2_humidity"],
+        sensor_data["dht4_humidity"],
+        sensor_data["dht5_humidity"]
+    ]
+    
+    temps = [temp for temp in temps if temp is not None]
+    humidities = [humidity for humidity in humidities if humidity is not None]
+    
+    avg_temp = statistics.mean(temps) if temps else None
+    avg_humidity = statistics.mean(humidities) if humidities else None
+    
+    return avg_temp, avg_humidity
+
+def distance_to_percentage(distance_cm):
+    """Convert distance measurement to water level percentage."""
+    if distance_cm is None:
+        return None
+    if distance_cm >= TANK_EMPTY_LEVEL:
+        return 0
+    if distance_cm <= TANK_FULL_LEVEL:
+        return 100
+    # Linear interpolation
+    percent = 100 * (TANK_EMPTY_LEVEL - distance_cm) / (TANK_EMPTY_LEVEL - TANK_FULL_LEVEL)
+    return round(percent, 1)
+
+#------------------------------------------------------------------------------
+# Control Functions
+#------------------------------------------------------------------------------
+def send_command(command):
+    """Send a command to the Arduino Mega."""
+    if manual_override or emergency_stop:
+        logging.warning(f"Command {command} not sent due to override/emergency")
+        return
+        
+    try:
+        ser.write((command + "\n").encode())
+        logging.info(f"Command sent: {command}")
+    except Exception as e:
+        logging.error(f"Failed to send command: {e}")
+
+def send_to_thingsboard(data):
+    """Send sensor data to ThingsBoard using the HTTP API."""
+    try:
+        url = THINGSBOARD_URL.format(ACCESS_TOKEN=ACCESS_TOKEN)
+        response = requests.post(url, json=data)
+        if response.status_code == 200:
+            logging.debug(f"Data sent to ThingsBoard: {data}")
+        else:
+            logging.error(f"Failed to send data. Status Code: {response.status_code}")
+    except Exception as e:
+        logging.error(f"Error sending data to ThingsBoard: {e}")
+
+def should_led_strip_be_on(switch_state):
+    now = datetime.datetime.now()
+    hour = now.hour
+    # From 21:00 to 4:59, always OFF
+    if hour >= 21 or hour < 5:
+        return False
+    # From 5:00 to 20:59, follow the switch
+    else:
+        return switch_state
+
+def control_led_strip_with_timer(switch_state, relay_pin, color=65535):
+    """Control the relay and color for the LED strip based on timer and switch state."""
+    if should_led_strip_be_on(switch_state):
+        send_command(f"RELAY:{relay_pin},1")  # Turn ON relay
+        send_command(f"LED_STRIP:{color}")    # Set color (adjust command as needed)
+    else:
+        send_command(f"RELAY:{relay_pin},0")  # Turn OFF relay
+
+def misting_pump_control(current_time):
+    """Control the misting pump with improved timing and safety checks."""
+    global last_misting_time, misting_pump_active, last_misting_end_time
+    
+    if (emergency_stop or manual_override or tank_refill_active or 
+        (current_time - refill_complete_time < REFILL_SETTLING_TIME * 1000)):
+        if misting_pump_active:
+            misting_pump_active = False
+            send_command("RELAY:35,0")
+            logging.info("Misting pump forced OFF due to system state")
+        return
+
+    if not misting_pump_active:
+        # Check if enough time has passed since last cycle
+        time_since_last = current_time - last_misting_end_time
+        if (time_since_last >= MISTING_INTERVAL * 1000 and 
+            time_since_last >= MIN_MISTING_CYCLE_GAP * 1000):
+            misting_pump_active = True
+            last_misting_time = current_time
+            send_command("RELAY:35,1")
+            logging.info("Misting pump activated")
+    else:
+        if current_time - last_misting_time >= MISTING_DURATION * 1000:
+            misting_pump_active = False
+            last_misting_end_time = current_time
+            send_command("RELAY:35,0")
+            logging.info("Misting pump deactivated after duration")
+
+def tank_reservoir_refill_control(distance_cm, current_time, tds=None, ph=None):
+    global tank_refill_active, nutrient_pump_active, nutrient_pump_start_time
+    global mixing_pump_active, previous_tank_level
+    global refill_complete_time, emergency_stop, distance_sensor_fail_time
+    global nutrients_added_this_cycle, tank_was_low_or_empty
+    global tds_baseline, ph_baseline
+
+    # Handle distance sensor failure
+    if distance_cm is None:
+        if distance_sensor_fail_time is None:
+            distance_sensor_fail_time = current_time
+            logging.warning("Distance sensor failed - starting fail timer")
+        elif (current_time - distance_sensor_fail_time > MAX_DISTANCE_SENSOR_FAIL_TIME * 1000):
+            emergency_stop = True
+            logging.error("EMERGENCY STOP: Distance sensor failed for too long")
+        return "Unknown"
+    else:
+        distance_sensor_fail_time = None
+        if emergency_stop:
+            emergency_stop = False
+            logging.info("Emergency stop cleared - distance sensor working")
+
+    # --- Water Level Determination (non-overlapping ranges) ---
+    if distance_cm < TANK_OVERLOW_LEVEL:
+        tank_level = "Overflow"
+    elif TANK_OVERLOW_LEVEL <= distance_cm < TANK_FULL_LEVEL:
+        tank_level = "Full"
+    elif TANK_FULL_LEVEL <= distance_cm < TANK_HALF_LEVEL:
+        tank_level = "Half"
+    elif TANK_HALF_LEVEL <= distance_cm < TANK_LOW_LEVEL:
+        tank_level = "Half"
+    elif TANK_LOW_LEVEL <= distance_cm <= TANK_EMPTY_LEVEL:
+        tank_level = "Low"
+    elif distance_cm <= TANK_EMPTY_LEVEL:
+        tank_level = "Empty"
+    else:
+        tank_level = "Unknown"
+
+    # --- Track if tank has reached Low or Empty since last Full ---
+    if tank_level in ("Low", "Empty"):
+        tank_was_low_or_empty = True
+
+    if tank_level == "Full" and previous_tank_level != "Full":
+        # Set baselines for TDS and pH right before nutrients are added
+        if tank_was_low_or_empty and not nutrients_added_this_cycle:
+            tds_baseline = tds if tds is not None else 0
+            ph_baseline = ph if ph is not None else 0
+            send_command("RELAY:33,1")  # Start mixing pump
+            mixing_pump_active = True
+            nutrient_pump_active = True
+            nutrient_pump_start_time = current_time
+            send_command("RELAY:30,1")  # Start nutrient A
+            send_command("RELAY:31,1")  # Start nutrient B
+            nutrients_added_this_cycle = True
+            logging.info(f"Mixing and nutrient addition started (baseline: TDS={tds_baseline}, pH={ph_baseline})")
+        tank_was_low_or_empty = False  # Reset for next cycle
+
+    # --- Reset nutrients_added flag when level drops below Full ---
+    if tank_level != "Full" and previous_tank_level == "Full":
+        nutrients_added_this_cycle = False
+
+    # --- Main control logic if level changed or nutrient pump is active ---
+    if tank_level != previous_tank_level or nutrient_pump_active:
+        logging.info(f"Tank level: {tank_level} (Distance: {distance_cm} cm)")
+
+        # Handle overflow
+        if tank_level == "Overflow":
+            tank_refill_active = False
+            nutrient_pump_active = False
+            mixing_pump_active = False
+            send_command("RELAY:32,0")  # Stop refill
+            send_command("RELAY:33,0")  # Stop mixing
+            send_command("RELAY:30,0")  # Stop nutrient A
+            send_command("RELAY:31,0")  # Stop nutrient B
+            emergency_stop = True
+            logging.warning("EMERGENCY STOP: Tank overflow detected!")
+
+        # Handle full (stop refill only)
+        elif tank_level == "Full":
+            if tank_refill_active:
+                tank_refill_active = False
+                refill_complete_time = current_time
+                send_command("RELAY:32,0")
+                logging.info("Tank refill stopped (reached full)")
+
+        # Handle low/empty (start refill, stop mixing/nutrients)
+        elif tank_level in ("Low", "Empty"):
+            if not tank_refill_active:
+                tank_refill_active = True
+                send_command("RELAY:32,1")
+                logging.info("Tank refill started (low/empty level)")
+            if mixing_pump_active:
+                send_command("RELAY:33,0")
+                mixing_pump_active = False
+                logging.info("Mixing pump stopped (low/empty level)")
+            if nutrient_pump_active:
+                send_command("RELAY:30,0")
+                send_command("RELAY:31,0")
+                nutrient_pump_active = False
+
+        # Optionally handle "Half" level here if needed
+
+    # --- Nutrient pump timeout (mixing pump continues running) ---
+    if nutrient_pump_active and (current_time - nutrient_pump_start_time >= NUTRIENT_PUMP_DURATION * 1000):
+        nutrient_pump_active = False
+        send_command("RELAY:30,0")
+        send_command("RELAY:31,0")
+        logging.info("Nutrient addition completed (mixing continues)")
+
+    previous_tank_level = tank_level
+    return tank_level
+
+def thermal_control():
+    """Control the thermal system based on temperature readings."""
+    if manual_override or emergency_stop:
+        return
+        
+    # Read temperature from sensors
+    sensor_data = read_sensor_data()
+    if not sensor_data:
+        return
+    
+    avg_temp, _ = average_dht_readings(sensor_data)
+    
+    if avg_temp is None:
+        return
+    
+    # Control logic for heating/cooling
+    if avg_temp > TEMP_MIN:
+        send_command("RELAY:37,1")  # Turn on heating
+        logging.info("Heating turned ON (Low Temperature)")
+    elif avg_temp < TEMP_MAX:
+        send_command("RELAY:37,0")  # Turn off heating
+        logging.info("Heating turned OFF (High Temperature)")
+
+def control_fans(avg_humidity):
+    """Control intake and exhaust fans based on average humidity."""
+    if avg_humidity is None or manual_override or emergency_stop:
+        return
+
+    humidity_avg = (HUMIDITY_MAX + HUMIDITY_MIN) / 2
+
+    if avg_humidity > HUMIDITY_MAX:
+        send_command("RELAY:27,1")  # Turn on INTAKE_FANS_PIN
+        send_command("RELAY:26,1")  # Turn on EXHAUST_FANS_PIN
+        logging.info("Fans turned ON (High Humidity)")
+    elif avg_humidity == humidity_avg:
+        send_command("RELAY:27,0")  # Turn off INTAKE_FANS_PIN
+        send_command("RELAY:26,0")  # Turn off EXHAUST_FANS_PIN
+        logging.info("Fans turned OFF (Humidity at average)")
+    elif avg_humidity > HUMIDITY_MIN:
+        send_command("RELAY:27,0")  # Turn off INTAKE_FANS_PIN
+        send_command("RELAY:26,0")  # Turn off EXHAUST_FANS_PIN
+        logging.info("Fans turned OFF (Low Humidity)")
+
+#------------------------------------------------------------------------------
+# Main Function
+#------------------------------------------------------------------------------        
+def main():
+    """Main control loop for the hydroponic system."""
+    global tds_baseline, ph_baseline
+    
+    # Start MQTT listener in a separate thread
+    mqtt_thread = threading.Thread(target=start_mqtt_listener, daemon=True)
+    mqtt_thread.start()
+    
+    # Start Flask web server in a separate thread
+    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
+    flask_thread.start()
+    
+    logging.info("Hydroponic system controller started")
+    logging.info(f"Web interface available at http://0.0.0.0:5000")
+    
+    while True:
+        current_time = time.time() * 1000  # Current time in milliseconds
+        
+        # Read sensor data
+        sensor_data = read_sensor_data()
+        if not sensor_data:
+            time.sleep(1)
+            continue
+        
+        misting_pump_control(current_time)
+        thermal_control()
+        avg_temp, avg_humidity = average_dht_readings(sensor_data)
+        control_fans(avg_humidity)
+
+        # Calculate derived values
+        water_temp = sensor_data["water_temperature"]
+        tds = calculate_tds(sensor_data["tds_raw_adc"], water_temp)
+        ph = calculate_ph(sensor_data["ph_raw_adc"])
+        water_level_percent = distance_to_percentage(sensor_data["distance_cm"])
+
+         # Tank and pump control (updates tank_refill_active)
+        tank_level = tank_reservoir_refill_control(sensor_data["distance_cm"], current_time, tds, ph)
+        
+        # Calculate net TDS and pH (after nutrients)
+        net_tds = tds - tds_baseline if tds is not None and tds_baseline is not None else None
+        net_ph = ph - ph_baseline if ph is not None and ph_baseline is not None else None
+
+        # Prepare telemetry data
+        telemetry_data = {
+            "water_temperature": water_temp,
+            "tds": tds if tds is not None else -1,
+            "ph": ph if ph is not None else -1,
+            "net_tds": net_tds if net_tds is not None else -1,
+            "net_ph": net_ph if net_ph is not None else -1,
+            "avg_temp_c": avg_temp,
+            "avg_humidity": avg_humidity,
+            "distance_cm": sensor_data["distance_cm"],
+            "water_level_percent": water_level_percent,
+            "tank_level": tank_level,
+            "misting_pump_active": misting_pump_active,
+            "tank_refill_active": tank_refill_active,
+            "nutrient_pump_active": nutrient_pump_active,
+            "mixing_pump_active": mixing_pump_active,
+            "current_reading": sensor_data["current_reading"],
+            "voltage_reading": sensor_data["voltage_reading"],
+            "emergency_stop": emergency_stop,
+            "manual_override": manual_override,
+            "relay22_state": relay22_state,
+            "relay23_state": relay23_state,
+            "relay28_state": relay28_state,
+            "relay29_state": relay29_state,
+            "camera_enabled": CAMERA_ENABLED,
+            "led_strip_tower1_active": should_led_strip_be_on(relay22_state),
+            "led_strip_tower2_active": should_led_strip_be_on(relay23_state)
+        }
+        
+        # Send data to cloud
+        logging.info(telemetry_data)  # For debugging
+        logging.debug(f"Telemetry data prepared: {telemetry_data}")
+        send_to_thingsboard(telemetry_data)
+        
+        # Log system status periodically
+        if current_time % 60000 < 100:  # Log every ~1 minute
+            logging.info(
+                f"System Status - "
+                f"TDS: {tds:.1f} ppm | "
+                f"pH: {ph:.1f} | "
+                f"Water Temp: {water_temp:.1f}°C | "
+                f"Air Temp: {avg_temp:.1f}°C | "
+                f"Humidity: {avg_humidity:.1f}% | "
+                f"Tank: {tank_level} | "
+                f"Misting: {'ON' if misting_pump_active else 'OFF'}"
+            )
+        
+        time.sleep(0.1)  # Main loop delay
+
+#------------------------------------------------------------------------------
+# Program Entry Point
+#------------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        if ser:
+            logging.info("Starting hydroponic system controller")
+            main()
+        else:
+            logging.error("Serial port not opened. Exiting...")
+    except KeyboardInterrupt:
+        logging.info("Program terminated by user")
+    finally:
+        # Cleanup
+        if ser and ser.is_open:
+            # Turn off all relays
+            for relay in [22, 23, 26, 27, 30, 31, 32, 33, 35, 37]:
+                send_command(f"RELAY:{relay},0")
+            ser.close()
+            logging.info("Serial port closed and all relays turned off")
+        
+        if CAMERA_ENABLED and cap.isOpened():
+            cap.release()
+            logging.info("Camera released")
+        
+        logging.info("System shutdown complete")
